@@ -1,5 +1,5 @@
-# BewlyBewly
-
+# BewlyBewly的AI 继续维护变种
+感谢大佬开源！！！！
 English | [官话 - 简体中文](README-cmn_CN.md) | [官話 - 繁體中文](README-cmn_TW.md) | [廣東話](README-jyut.md)
 
 <p align="center" style="margin-bottom: 0px !important;">

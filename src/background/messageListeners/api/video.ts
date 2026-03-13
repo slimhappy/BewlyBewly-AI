@@ -1,20 +1,30 @@
+import { encodeWbi } from '../../../utils/wbiSign'
 import type { APIMAP } from '../../utils'
 import { AHS } from '../../utils'
 
 const API_VIDEO = {
-  getRecommendVideos: {
-    url: 'https://api.bilibili.com/x/web-interface/index/top/feed/rcmd',
-    _fetch: {
-      method: 'get',
-    },
-    params: {
-      fresh_idx: 0,
-      feed_version: 'V2',
+  getRecommendVideos: async (message: any) => {
+    // Fetch WBI keys from nav API
+    const navRes = await fetch('https://api.bilibili.com/x/web-interface/nav')
+    const navJson = await navRes.json()
+    const imgUrl: string = navJson?.data?.wbi_img?.img_url ?? ''
+    const subUrl: string = navJson?.data?.wbi_img?.sub_url ?? ''
+    const imgKey = imgUrl.slice(imgUrl.lastIndexOf('/') + 1, imgUrl.lastIndexOf('.'))
+    const subKey = subUrl.slice(subUrl.lastIndexOf('/') + 1, subUrl.lastIndexOf('.'))
+
+    const baseParams: Record<string, string | number> = {
+      fresh_idx: message.fresh_idx ?? 1,
+      feed_version: 'V8',
       fresh_type: 4,
-      ps: 30,
+      ps: message.ps ?? 30,
       plat: 1,
-    },
-    afterHandle: AHS.J_D,
+      web_location: 1430650,
+    }
+
+    const signedParams = encodeWbi(baseParams, imgKey, subKey)
+    const query = new URLSearchParams(signedParams as any).toString()
+    const res = await fetch(`https://api.bilibili.com/x/web-interface/wbi/index/top/feed/rcmd?${query}`)
+    return res.json()
   },
   getAppRecommendVideos: {
     url: 'https://app.bilibili.com/x/v2/feed/index',

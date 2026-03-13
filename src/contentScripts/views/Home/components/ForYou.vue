@@ -181,6 +181,8 @@ async function getRecommendVideos() {
       const resData = [] as VideoItem[]
 
       response.data.item.forEach((item: VideoItem) => {
+        if (item.goto !== 'av')
+          return
         if (!filterFunc.value || filterFunc.value(item))
           resData.push(item)
       })

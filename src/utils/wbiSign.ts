@@ -1,4 +1,5 @@
-// https://socialsisteryi.github.io/bilibili-API-collect/docs/misc/sign/wbi.html
+// Helpers for the current Bilibili WBI-signed web API.
+// Spec: https://socialsisteryi.github.io/bilibili-API-collect/docs/misc/sign/wbi.html
 // Character shuffle table
 const MIXIN_KEY_ENC_TAB = [
   46,
@@ -254,4 +255,86 @@ export function encodeWbi(
   const w_rid = md5(query + mixinKey)
 
   return { ...paramsWithWts, w_rid }
+}
+
+/**
+ * Build a ready-to-use query string using exactly the same encoding as the
+ * `w_rid` computation.
+ *
+ * `URLSearchParams` encodes a space as `+` while `encodeURIComponent` emits
+ * `%20`. Sending a query built with the former while signing with the latter
+ * makes Bilibili reject the signature. Always send what this returns.
+ */
+export function buildWbiQuery(
+  params: Record<string, string | number>,
+  imgKey: string,
+  subKey: string,
+  timestamp?: number,
+): string {
+  const signed = encodeWbi(params, imgKey, subKey, timestamp)
+  return Object.keys(signed)
+    .sort()
+    .map(k => `${encodeURIComponent(k)}=${encodeURIComponent(String(signed[k]))}`)
+    .join('&')
+}
+
+export interface WbiKeys {
+  imgKey: string
+  subKey: string
+}
+
+function keyFromUrl(url: unknown): string {
+  if (typeof url !== 'string')
+    return ''
+  const start = url.lastIndexOf('/') + 1
+  const end = url.lastIndexOf('.')
+  return end > start ? url.slice(start, end) : ''
+}
+
+/**
+ * Read WBI keys from `/x/web-interface/nav`.
+ * Bilibili still returns `data.wbi_img` when `code === -101` (not logged in),
+ * so the HTTP status / envelope code is intentionally not checked here.
+ */
+export function extractWbiKeys(nav: unknown): WbiKeys | null {
+  const wbiImg = (nav as { data?: { wbi_img?: { img_url?: unknown, sub_url?: unknown } } } | null)?.data?.wbi_img
+  const imgKey = keyFromUrl(wbiImg?.img_url)
+  const subKey = keyFromUrl(wbiImg?.sub_url)
+  return imgKey && subKey ? { imgKey, subKey } : null
+}
+
+export interface NormalizedRcmd {
+  code: number
+  message: string
+  data: {
+    item: unknown[]
+    [key: string]: unknown
+  }
+}
+
+/**
+ * Normalize a `/wbi/index/top/feed/rcmd` payload.
+ *
+ * On rate limiting / WAF challenges Bilibili answers with an HTML 412 page or
+ * a JSON envelope whose `data` has no `item`. Returning a stable shape here
+ * keeps the homepage from throwing (and from retrying forever) in those cases.
+ */
+export function normalizeRcmdResponse(payload: unknown, fallbackMessage = 'Invalid response'): NormalizedRcmd {
+  const empty = (): NormalizedRcmd => ({ code: -1, message: fallbackMessage, data: { item: [] } })
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload))
+    return empty()
+
+  const raw = payload as Record<string, unknown>
+  const rawData = raw.data && typeof raw.data === 'object' && !Array.isArray(raw.data)
+    ? raw.data as Record<string, unknown>
+    : {}
+
+  return {
+    code: typeof raw.code === 'number' ? raw.code : -1,
+    message: typeof raw.message === 'string' ? raw.message : fallbackMessage,
+    data: {
+      ...rawData,
+      item: Array.isArray(rawData.item) ? rawData.item : [],
+    },
+  }
 }

@@ -1,30 +1,73 @@
-import { encodeWbi } from '../../../utils/wbiSign'
+import type { WbiKeys } from '../../../utils/wbiSign'
+import { buildWbiQuery, extractWbiKeys, normalizeRcmdResponse } from '../../../utils/wbiSign'
 import type { APIMAP } from '../../utils'
 import { AHS } from '../../utils'
 
+const API_ORIGIN = 'https://api.bilibili.com'
+const NAV_URL = `${API_ORIGIN}/x/web-interface/nav`
+const RCMD_URL = `${API_ORIGIN}/x/web-interface/wbi/index/top/feed/rcmd`
+const WBI_KEY_TTL = 30 * 60 * 1000
+const REQUEST_TIMEOUT = 10_000
+
+// Chrome attaches `Origin: chrome-extension://<id>` to cross-origin requests
+// made from the MV3 service worker. Bilibili's WAF replies HTTP 412 to that
+// origin, so assets/rules.json rewrites Origin/Referer for EVERY api.bilibili.com
+// XHR (GET included). `referrer` is set here too for engines that honour it.
+async function fetchJson(url: string): Promise<unknown> {
+  const path = new URL(url).pathname
+  const res = await fetch(url, {
+    referrer: 'https://www.bilibili.com/',
+    signal: AbortSignal.timeout(REQUEST_TIMEOUT),
+  })
+  const text = await res.text()
+  if (!res.ok)
+    throw new Error(`HTTP ${res.status} from ${path}`)
+  try {
+    return JSON.parse(text)
+  }
+  catch {
+    throw new Error(`Non-JSON response (HTTP ${res.status}) from ${path}`)
+  }
+}
+
+// WBI keys rotate daily; avoid an extra nav round-trip on every scroll/refresh.
+let cachedWbiKeys: { keys: WbiKeys, fetchedAt: number } | null = null
+
+async function getWbiKeys(): Promise<WbiKeys> {
+  if (cachedWbiKeys && Date.now() - cachedWbiKeys.fetchedAt < WBI_KEY_TTL)
+    return cachedWbiKeys.keys
+  const keys = extractWbiKeys(await fetchJson(NAV_URL))
+  if (!keys)
+    throw new Error('WBI keys missing from nav response')
+  cachedWbiKeys = { keys, fetchedAt: Date.now() }
+  return keys
+}
+
 const API_VIDEO = {
   getRecommendVideos: async (message: any) => {
-    // Fetch WBI keys from nav API
-    const navRes = await fetch('https://api.bilibili.com/x/web-interface/nav')
-    const navJson = await navRes.json()
-    const imgUrl: string = navJson?.data?.wbi_img?.img_url ?? ''
-    const subUrl: string = navJson?.data?.wbi_img?.sub_url ?? ''
-    const imgKey = imgUrl.slice(imgUrl.lastIndexOf('/') + 1, imgUrl.lastIndexOf('.'))
-    const subKey = subUrl.slice(subUrl.lastIndexOf('/') + 1, subUrl.lastIndexOf('.'))
+    try {
+      const { imgKey, subKey } = await getWbiKeys()
+      const query = buildWbiQuery({
+        fresh_idx: message.fresh_idx ?? 1,
+        feed_version: 'V8',
+        fresh_type: 4,
+        ps: message.ps ?? 30,
+        plat: 1,
+        web_location: 1430650,
+      }, imgKey, subKey)
 
-    const baseParams: Record<string, string | number> = {
-      fresh_idx: message.fresh_idx ?? 1,
-      feed_version: 'V8',
-      fresh_type: 4,
-      ps: message.ps ?? 30,
-      plat: 1,
-      web_location: 1430650,
+      return normalizeRcmdResponse(await fetchJson(`${RCMD_URL}?${query}`))
     }
-
-    const signedParams = encodeWbi(baseParams, imgKey, subKey)
-    const query = new URLSearchParams(signedParams as any).toString()
-    const res = await fetch(`https://api.bilibili.com/x/web-interface/wbi/index/top/feed/rcmd?${query}`)
-    return res.json()
+    catch (e) {
+      // Never reject: a rejected message makes the homepage retry forever and
+      // leaves its skeleton screens spinning. Force a key refresh next time.
+      cachedWbiKeys = null
+      return {
+        code: -1,
+        message: e instanceof Error ? e.message : String(e),
+        data: { item: [] },
+      }
+    }
   },
   getAppRecommendVideos: {
     url: 'https://app.bilibili.com/x/v2/feed/index',

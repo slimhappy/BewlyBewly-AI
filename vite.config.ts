@@ -75,7 +75,7 @@ export const sharedConfig: UserConfig = {
   },
 }
 
-export default defineConfig(({ command }) => ({
+export default defineConfig(({ command, mode }) => ({
   ...sharedConfig,
   base: command === 'serve' ? `http://localhost:${port}/` : '/dist/',
   server: {
@@ -103,7 +103,10 @@ export default defineConfig(({ command }) => ({
   plugins: [
     ...sharedConfig.plugins!,
 
-    MV3Hmr(),
+    // MV3Hmr writes transformed dev modules into extension/ on every dev
+    // server start. Vitest boots the same server, which caused EPERM on
+    // Windows and aborted the test run with an unhandled rejection.
+    ...(mode === 'test' ? [] : [MV3Hmr()]),
   ],
   test: {
     globals: true,

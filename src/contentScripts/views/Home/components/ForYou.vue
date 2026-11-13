@@ -9,7 +9,7 @@ import type { GridLayoutType } from '~/logic'
 import { accessKey, settings } from '~/logic'
 import type { AppForYouResult, Item as AppVideoItem } from '~/models/video/appForYou'
 import { Type as ThreePointV2Type } from '~/models/video/appForYou'
-import type { forYouResult, Item as VideoItem } from '~/models/video/forYou'
+import type { Item as VideoItem } from '~/models/video/forYou'
 import api from '~/utils/api'
 import { TVAppKey } from '~/utils/authProvider'
 import { isVerticalVideo } from '~/utils/uriParse'
@@ -66,6 +66,10 @@ const videoCardRef = ref(null)
 const showDislikeDialog = ref<boolean>(false)
 const selectedDislikeReason = ref<number>(1)
 const PAGE_SIZE = 30
+// Bilibili can answer with an empty feed (rate limit / risk control / schema
+// change). Cap the "fill the viewport" retries so the skeleton never spins
+// forever and the extension stops hammering the API.
+const MAX_AUTO_RETRY = 2
 
 onKeyStroke((e: KeyboardEvent) => {
   if (showDislikeDialog.value) {
@@ -115,6 +119,11 @@ onActivated(() => {
 async function initData() {
   videoList.value.length = 0
   appVideoList.value.length = 0
+  // These flags must be reset on refresh, otherwise a previous "no more
+  // content" / login state permanently blocks further loading.
+  noMoreContent.value = false
+  needToLoginFirst.value = false
+  refreshIdx.value = 1
   await getData()
 }
 
@@ -154,7 +163,7 @@ function initPageAction() {
   }
 }
 
-async function getRecommendVideos() {
+async function getRecommendVideos(retryLeft: number = MAX_AUTO_RETRY) {
   try {
     let i = 0
     if (!filterFunc.value || (videoList.value.length < PAGE_SIZE && filterFunc.value)) {
@@ -167,76 +176,84 @@ async function getRecommendVideos() {
       videoList.value.push(...pendingVideos)
     }
 
-    const response: forYouResult = await api.video.getRecommendVideos({
+    // The background listener normalizes every failure into a stable envelope,
+    // so this is intentionally not asserted as `forYouResult`.
+    const response = await api.video.getRecommendVideos({
       fresh_idx: refreshIdx.value++,
       ps: PAGE_SIZE,
     })
 
-    if (!response.data) {
+    // Bilibili answers with code -352 / -412 / an HTML page when rate-limited,
+    // and `data.item` can be missing entirely after a schema change.
+    const rawItems: unknown = response?.data?.item
+    const items: VideoItem[] = Array.isArray(rawItems) ? rawItems as VideoItem[] : []
+
+    if (response?.code !== 0) {
+      if (response?.code === 62011)
+        needToLoginFirst.value = true
+      else
+        noMoreContent.value = true
+      return
+    }
+
+    if (!items.length) {
       noMoreContent.value = true
       return
     }
 
-    if (response.code === 0) {
-      const resData = [] as VideoItem[]
+    // Drop ad / live / bangumi cards: they carry no owner or stat and would
+    // crash the VideoCard template.
+    const resData = items.filter(item => item.goto === 'av' && (!filterFunc.value || filterFunc.value(item)))
 
-      response.data.item.forEach((item: VideoItem) => {
-        if (item.goto !== 'av')
-          return
-        if (!filterFunc.value || filterFunc.value(item))
-          resData.push(item)
-      })
-
-      // when videoList has length property, it means it is the first time to load
-      if (!videoList.value.length) {
-        videoList.value = resData.map(item => ({ uniqueId: `${item.id}`, item }))
-      }
-      else {
-        resData.forEach((item) => {
-          // If the `filterFunc` is unset, indicating that the user hasn't specified the filter,
-          // skep the `findFirstEmptyItemIndex` check to enhance the performance
-          if (!filterFunc.value) {
+    // when videoList has length property, it means it is the first time to load
+    if (!videoList.value.length) {
+      videoList.value = resData.map(item => ({ uniqueId: `${item.id}`, item }))
+    }
+    else {
+      resData.forEach((item) => {
+        // If the `filterFunc` is unset, indicating that the user hasn't specified the filter,
+        // skep the `findFirstEmptyItemIndex` check to enhance the performance
+        if (!filterFunc.value) {
+          videoList.value.push({
+            uniqueId: `${item.id}`,
+            item,
+          })
+        }
+        else {
+          const findFirstEmptyItemIndex = videoList.value.findIndex(video => !video.item)
+          if (findFirstEmptyItemIndex !== -1) {
+            videoList.value[findFirstEmptyItemIndex] = {
+              uniqueId: `${item.id}`,
+              item,
+            }
+          }
+          else {
             videoList.value.push({
               uniqueId: `${item.id}`,
               item,
             })
           }
-          else {
-            const findFirstEmptyItemIndex = videoList.value.findIndex(video => !video.item)
-            if (findFirstEmptyItemIndex !== -1) {
-              videoList.value[findFirstEmptyItemIndex] = {
-                uniqueId: `${item.id}`,
-                item,
-              }
-            }
-            else {
-              videoList.value.push({
-                uniqueId: `${item.id}`,
-                item,
-              })
-            }
-          }
-        })
-      }
+        }
+      })
     }
-    else if (response.code === 62011) {
-      needToLoginFirst.value = true
-    }
+  }
+  catch (e) {
+    console.error('[BewlyBewly] getRecommendVideos failed:', e)
+    noMoreContent.value = true
   }
   finally {
     const filledItems = videoList.value.filter(video => video.item)
     videoList.value = filledItems
 
-    if (!needToLoginFirst.value) {
+    if (!needToLoginFirst.value && !noMoreContent.value && retryLeft > 0) {
       await nextTick()
-      if (!await haveScrollbar() || filledItems.length < PAGE_SIZE || filledItems.length < 1) {
-        getRecommendVideos()
-      }
+      if (!await haveScrollbar() || filledItems.length < PAGE_SIZE)
+        await getRecommendVideos(retryLeft - 1)
     }
   }
 }
 
-async function getAppRecommendVideos() {
+async function getAppRecommendVideos(retryLeft: number = MAX_AUTO_RETRY) {
   try {
     let i = 0
     if (!appFilterFunc.value || (appVideoList.value.length < PAGE_SIZE && appFilterFunc.value)) {
@@ -257,60 +274,72 @@ async function getAppRecommendVideos() {
       idx: appVideoList.value.length > 0 ? appVideoList.value[appVideoList.value.length - 1].item?.idx : 1,
     })
 
-    if (response.code === 0) {
-      const resData = [] as AppVideoItem[]
+    const rawItems: unknown = response?.data?.items
+    const items: AppVideoItem[] = Array.isArray(rawItems) ? rawItems as AppVideoItem[] : []
 
-      response.data.items.forEach((item: AppVideoItem) => {
-        // Remove banner & ad cards
-        if (!item.card_type.includes('banner') && item.card_type !== 'cm_v1' && (!appFilterFunc.value || appFilterFunc.value(item)))
-          resData.push(item)
-      })
+    if (response?.code !== 0) {
+      if (response?.code === 62011)
+        needToLoginFirst.value = true
+      else
+        noMoreContent.value = true
+      return
+    }
 
-      // when videoList has length property, it means it is the first time to load
-      if (!appVideoList.value.length) {
-        appVideoList.value = resData.map(item => ({ uniqueId: `${item.idx}`, item }))
-      }
-      else {
-        resData.forEach((item) => {
-          // If the `appFilterFunc` is unset, indicating that the user hasn't specified the filter,
-          // skep the `findFirstEmptyItemIndex` check to enhance the performance
-          if (!appFilterFunc.value) {
+    if (!items.length) {
+      noMoreContent.value = true
+      return
+    }
+
+    // Remove banner & ad cards
+    const resData = items.filter(item =>
+      !item.card_type?.includes('banner')
+      && item.card_type !== 'cm_v1'
+      && (!appFilterFunc.value || appFilterFunc.value(item)))
+
+    // when videoList has length property, it means it is the first time to load
+    if (!appVideoList.value.length) {
+      appVideoList.value = resData.map(item => ({ uniqueId: `${item.idx}`, item }))
+    }
+    else {
+      resData.forEach((item) => {
+        // If the `appFilterFunc` is unset, indicating that the user hasn't specified the filter,
+        // skep the `findFirstEmptyItemIndex` check to enhance the performance
+        if (!appFilterFunc.value) {
+          appVideoList.value.push({
+            uniqueId: `${item.idx}`,
+            item,
+          })
+        }
+        else {
+          const findFirstEmptyItemIndex = appVideoList.value.findIndex(video => !video.item)
+          if (findFirstEmptyItemIndex !== -1) {
+            appVideoList.value[findFirstEmptyItemIndex] = {
+              uniqueId: `${item.idx}`,
+              item,
+            }
+          }
+          else {
             appVideoList.value.push({
               uniqueId: `${item.idx}`,
               item,
             })
           }
-          else {
-            const findFirstEmptyItemIndex = appVideoList.value.findIndex(video => !video.item)
-            if (findFirstEmptyItemIndex !== -1) {
-              appVideoList.value[findFirstEmptyItemIndex] = {
-                uniqueId: `${item.idx}`,
-                item,
-              }
-            }
-            else {
-              appVideoList.value.push({
-                uniqueId: `${item.idx}`,
-                item,
-              })
-            }
-          }
-        })
-      }
+        }
+      })
     }
-    else if (response.code === 62011) {
-      needToLoginFirst.value = true
-    }
+  }
+  catch (e) {
+    console.error('[BewlyBewly] getAppRecommendVideos failed:', e)
+    noMoreContent.value = true
   }
   finally {
     const filledItems = appVideoList.value.filter(video => video.item)
     appVideoList.value = filledItems
 
-    if (!needToLoginFirst.value) {
+    if (!needToLoginFirst.value && !noMoreContent.value && retryLeft > 0) {
       await nextTick()
-      if (!await haveScrollbar() || filledItems.length < PAGE_SIZE || filledItems.length < 1) {
-        getAppRecommendVideos()
-      }
+      if (!await haveScrollbar() || filledItems.length < PAGE_SIZE)
+        await getAppRecommendVideos(retryLeft - 1)
     }
   }
 }
